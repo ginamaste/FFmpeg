@@ -1,0 +1,235 @@
+name: Encode Benchmark Research
+
+on:
+  workflow_dispatch:
+    inputs:
+      part_path:
+        description: 'Google Drive Path to Part (e.g. tarik/tarik_2026-11-05/part_20261105_120000.ts)'
+        required: true
+        type: string
+      encoder:
+        description: 'Encoding Strategy to Test'
+        required: true
+        type: choice
+        default: 'benchmark_comparison'
+        options:
+          - 'benchmark_comparison'
+          - 'h264_veryfast'
+          - 'h264_medium'
+          - 'h265_fast'
+          - 'av1_svt'
+          - 'custom'
+      sample_seconds:
+        description: 'Duration to test in seconds (0 = full part, 60 = first 1 min, 120 = first 2 min)'
+        required: false
+        default: '60'
+        type: string
+      custom_args:
+        description: 'Custom FFmpeg arguments (used only if encoder is "custom")'
+        required: false
+        default: '-c:v libx264 -crf 23 -preset veryfast -c:a aac -b:a 128k'
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  encode_research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free Runner Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          docker image prune -a --force >/dev/null 2>&1 || true
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends rclone ffmpeg
+          echo "=== FFmpeg Encoders Available ==="
+          ffmpeg -hide_banner -encoders | grep -E 'libx264|libx265|libsvtav1|libvpx' || true
+
+      - name: Setup Rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "ERROR: RCLONE_CONF secret is not set!" >&2
+            exit 1
+          fi
+
+          CLEAN_CONF="$RCLONE_CONF"
+          if echo "$RCLONE_CONF" | grep -qv '\['; then
+            DECODED_CONF=$(echo "$RCLONE_CONF" | base64 -d 2>/dev/null || true)
+            if echo "$DECODED_CONF" | grep -q '\['; then
+              CLEAN_CONF="$DECODED_CONF"
+            fi
+          fi
+
+          if echo "$CLEAN_CONF" | grep -q '"type": *"service_account"'; then
+            echo "$CLEAN_CONF" > /tmp/gdrive_sa.json
+            cat <<EOF > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /tmp/gdrive_sa.json
+
+          [storage]
+          type = alias
+          remote = gdrive:
+          EOF
+          else
+            echo "$CLEAN_CONF" | tr -d '\r' > ~/.config/rclone/rclone.conf
+            FIRST_REMOTE=$(grep -m 1 -o '\[.*\]' ~/.config/rclone/rclone.conf | head -n 1 | tr -d '[]\r')
+            if [ -n "$FIRST_REMOTE" ] && [ "$FIRST_REMOTE" != "storage" ] && ! grep -q "\[storage\]" ~/.config/rclone/rclone.conf; then
+              echo -e "\n[storage]\ntype = alias\nremote = ${FIRST_REMOTE}:" >> ~/.config/rclone/rclone.conf
+            fi
+          fi
+
+      - name: Download & Run Encode Research
+        run: |
+          RAW_PATH="${{ inputs.part_path }}"
+          RAW_PATH=$(echo "$RAW_PATH" | tr -d '\r' | xargs)
+          ENCODER="${{ inputs.encoder }}"
+          SAMPLE_SECS="${{ inputs.sample_seconds }}"
+          CUSTOM_ARGS="${{ inputs.custom_args }}"
+
+          # Normalize input remote path
+          if [[ "$RAW_PATH" == "storage:"* ]]; then
+            REMOTE_FILE="$RAW_PATH"
+          elif [[ "$RAW_PATH" == "Twitch/"* ]]; then
+            REMOTE_FILE="storage:${RAW_PATH}"
+          elif [[ "$RAW_PATH" == *":"* ]]; then
+            REMOTE_FILE="$RAW_PATH"
+          else
+            REMOTE_FILE="storage:Twitch/${RAW_PATH#/}"
+          fi
+
+          REMOTE_DIR=$(dirname "$REMOTE_FILE")
+          FILE_NAME=$(basename "$REMOTE_FILE")
+          BASE_NAME="${FILE_NAME%.*}"
+
+          WORK_DIR="/tmp/encode_research"
+          OUTPUT_DIR="${WORK_DIR}/outputs"
+          mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+
+          echo "Downloading $REMOTE_FILE..."
+          rclone copyto "$REMOTE_FILE" "${WORK_DIR}/${FILE_NAME}" --drive-chunk-size 64M
+
+          if [ ! -s "${WORK_DIR}/${FILE_NAME}" ]; then
+            echo "ERROR: File could not be downloaded or is empty: $REMOTE_FILE" >&2
+            exit 1
+          fi
+
+          INPUT_FILE="${WORK_DIR}/${FILE_NAME}"
+          ORIGINAL_BYTES=$(stat -c%s "$INPUT_FILE")
+          ORIGINAL_MB=$(awk "BEGIN {printf \"%.2f\", $ORIGINAL_BYTES/1048576}")
+          echo "Original File: $FILE_NAME ($ORIGINAL_MB MB)"
+
+          TIME_FLAG=""
+          if [ -n "$SAMPLE_SECS" ] && [ "$SAMPLE_SECS" -gt 0 ] 2>/dev/null; then
+            TIME_FLAG="-t $SAMPLE_SECS"
+            echo "Testing first $SAMPLE_SECS seconds of video."
+          else
+            echo "Testing full video file."
+          fi
+
+          REPORT_FILE="${OUTPUT_DIR}/benchmark_report.txt"
+          cat <<EOF > "$REPORT_FILE"
+=======================================================
+ENCODING BENCHMARK REPORT
+Source File   : $FILE_NAME
+Original Size : $ORIGINAL_MB MB
+Sample Tested : ${SAMPLE_SECS:-Full} seconds
+Runner CPU    : $(grep -m 1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs) (2 vCPUs)
+=======================================================
+EOF
+
+          BASELINE_BYTES=0
+
+          run_benchmark() {
+            local label="$1"
+            local ext="$2"
+            local args="$3"
+            local outfile="${OUTPUT_DIR}/${BASE_NAME}_${label}.${ext}"
+
+            echo ""
+            echo "-------------------------------------------------------"
+            echo "Running: $label"
+            echo "Args   : $args"
+            echo "-------------------------------------------------------"
+
+            local start_time=$(date +%s%N)
+            ffmpeg -nostdin -y -hide_banner $TIME_FLAG -i "$INPUT_FILE" $args -movflags +faststart "$outfile" 2>&1 | tail -n 8
+            local end_time=$(date +%s%N)
+
+            if [ -s "$outfile" ]; then
+              local dur_ms=$(( (end_time - start_time) / 1000000 ))
+              local dur_sec=$(awk "BEGIN {printf \"%.2f\", $dur_ms/1000}")
+              local out_bytes=$(stat -c%s "$outfile")
+              local out_mb=$(awk "BEGIN {printf \"%.2f\", $out_bytes/1048576}")
+
+              if [ "$BASELINE_BYTES" -eq 0 ]; then
+                BASELINE_BYTES="$out_bytes"
+              fi
+
+              local reduction=$(awk "BEGIN {printf \"%.1f\", (1 - ($out_bytes / $BASELINE_BYTES)) * 100}")
+
+              printf "%-26s | Time: %7ss | Size: %7s MB | Saved vs Copy: %5s%%\n" "$label" "$dur_sec" "$out_mb" "$reduction"
+              echo "$label: Time=${dur_sec}s, Size=${out_mb}MB, SavedVsCopy=${reduction}%" >> "$REPORT_FILE"
+            else
+              echo "FAILED: $label did not produce an output" | tee -a "$REPORT_FILE"
+            fi
+          }
+
+          if [ "$ENCODER" = "benchmark_comparison" ]; then
+            # 1. Baseline: Direct Stream Copy (remux only, zero re-encode)
+            run_benchmark "01_copy" "mp4" "-c copy"
+
+            # 2. H.264 Veryfast (Recommended for fast cloud jobs)
+            run_benchmark "02_h264_crf23_veryfast" "mp4" "-c:v libx264 -crf 23 -preset veryfast -c:a aac -b:a 128k"
+
+            # 3. H.264 Higher compression (CRF 26)
+            run_benchmark "03_h264_crf26_veryfast" "mp4" "-c:v libx264 -crf 26 -preset veryfast -c:a aac -b:a 128k"
+
+            # 4. H.265 (HEVC) Fast
+            if ffmpeg -hide_banner -encoders | grep -q "libx265"; then
+              run_benchmark "04_h265_crf26_fast" "mp4" "-c:v libx265 -crf 26 -preset fast -tag:v hvc1 -c:a aac -b:a 128k"
+            fi
+
+            # 5. SVT-AV1 (Modern open source AV1)
+            if ffmpeg -hide_banner -encoders | grep -q "libsvtav1"; then
+              run_benchmark "05_av1_crf28_p8" "mp4" "-c:v libsvtav1 -crf 28 -preset 8 -c:a aac -b:a 128k"
+            fi
+          elif [ "$ENCODER" = "h264_veryfast" ]; then
+            run_benchmark "01_copy" "mp4" "-c copy"
+            run_benchmark "h264_crf23_veryfast" "mp4" "-c:v libx264 -crf 23 -preset veryfast -c:a aac -b:a 128k"
+          elif [ "$ENCODER" = "h264_medium" ]; then
+            run_benchmark "01_copy" "mp4" "-c copy"
+            run_benchmark "h264_crf23_medium" "mp4" "-c:v libx264 -crf 23 -preset medium -c:a aac -b:a 128k"
+          elif [ "$ENCODER" = "h265_fast" ]; then
+            run_benchmark "01_copy" "mp4" "-c copy"
+            run_benchmark "h265_crf26_fast" "mp4" "-c:v libx265 -crf 26 -preset fast -tag:v hvc1 -c:a aac -b:a 128k"
+          elif [ "$ENCODER" = "av1_svt" ]; then
+            run_benchmark "01_copy" "mp4" "-c copy"
+            run_benchmark "av1_crf28_p8" "mp4" "-c:v libsvtav1 -crf 28 -preset 8 -c:a aac -b:a 128k"
+          elif [ "$ENCODER" = "custom" ]; then
+            run_benchmark "01_copy" "mp4" "-c copy"
+            run_benchmark "custom_encode" "mp4" "$CUSTOM_ARGS"
+          fi
+
+          echo ""
+          echo "======================================================="
+          cat "$REPORT_FILE"
+          echo "======================================================="
+
+          # Upload all encoded tests and report back to Google Drive
+          DEST_FOLDER="${REMOTE_DIR}/encode_research"
+          echo "Uploading benchmark outputs to ${DEST_FOLDER}..."
+          rclone copy "$OUTPUT_DIR" "$DEST_FOLDER" --drive-chunk-size 64M --transfers 4
+
+          echo "Benchmark test completed successfully! Check Google Drive: ${DEST_FOLDER}"

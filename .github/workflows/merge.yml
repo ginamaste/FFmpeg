@@ -35,3 +35,4 @@ jobs:
           fi
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          AUTH: ${{ secrets.AUTH }}
